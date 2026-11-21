@@ -1,8 +1,8 @@
 """ZIP file helpers and monkey-patches for zstd support.
 
-On Python < 3.14 we import ``zipfile_zstd`` to monkey-patch zstandard
-compression into the stdlib ``zipfile`` module. Python 3.14+ handles zstd
-natively via stdlib.
+Python 3.14+ ``zipfile`` supports zstd (method 93) natively. On earlier
+versions we register the method on the stdlib ``zipfile`` module ourselves,
+backed by ``backports.zstd``.
 
 Additionally, we install a second monkey-patch on ``zipfile._get_compressor``
 that caps each emitted zstd frame at ``_MAX_INPUT_PER_FRAME`` bytes of input.
@@ -19,23 +19,50 @@ import tempfile
 import time
 import zipfile
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any, BinaryIO
+from typing import Any, BinaryIO
 
 import anyio
 import anyio.from_thread
 
-if TYPE_CHECKING:
-    import zstandard
+from inspect_ai._util.zstd import (
+    CompressionParameter,
+    ZstdCompressor,
+    ZstdMultiFrameDecompressor,
+)
 
 logger = logging.getLogger(__name__)
 
-# On Python < 3.14, monkey-patch zipfile to support zstandard compression.
-if sys.version_info < (3, 14):
-    import zipfile_zstd  # type: ignore[import-not-found, import-untyped]  # noqa: F401
 
-# Resolve once so the rest of the module can use a plain int; also fails loudly
-# at import time rather than at first call if the attribute is ever missing.
-_ZIP_ZSTANDARD: int = zipfile.ZIP_ZSTANDARD  # type: ignore[attr-defined]
+def _register_zip_zstandard() -> int:
+    """Register zstd (method 93) on the stdlib ``zipfile`` module (Python < 3.14).
+
+    Defines ``ZIP_ZSTANDARD`` and the method's name, and makes
+    ``_check_compression`` accept it, as Python 3.14 ``zipfile`` does.
+    Compressor and decompressor come from ``_install_multiframe_patches``.
+    Member headers keep zipfile's default "version needed to extract", as
+    they did with the ``zipfile-zstd`` package this replaces. Idempotent.
+    """
+    method = 93
+    # zipfile's private names are not in its type stubs
+    module = vars(zipfile)
+    if module.get("ZIP_ZSTANDARD") == method:
+        return method
+    module["compressor_names"][method] = "zstd"
+    original_check = module["_check_compression"]
+
+    def check_compression(compression: int) -> None:
+        if compression != method:
+            original_check(compression)
+
+    module["_check_compression"] = check_compression
+    module["ZIP_ZSTANDARD"] = method
+    return method
+
+
+if sys.version_info >= (3, 14):
+    _ZIP_ZSTANDARD: int = zipfile.ZIP_ZSTANDARD
+else:
+    _ZIP_ZSTANDARD = _register_zip_zstandard()
 
 zipfile_compress_kwargs: dict[str, Any] = {
     "compression": _ZIP_ZSTANDARD,
@@ -66,24 +93,30 @@ zipfile_compress_kwargs: dict[str, Any] = {
 # or raise _MAX_INPUT_PER_FRAME, without staying under those limits.
 _MAX_INPUT_PER_FRAME = 200 * 1024 * 1024
 
-# Matches zipfile_zstd's hardcoded default so multi-frame and single-frame zip
-# writes use the same thread count. If zipfile_zstd ever changes its default,
-# update here too.
+# Worker threads for zstd compression, as zipfile_zstd used before; capped at
+# what libzstd supports (0 when it is built without multithreading).
 _ZSTD_THREADS = 12
+
+
+def _zstd_compressor(level: int) -> ZstdCompressor:
+    options: dict[int, int] = {CompressionParameter.compression_level: level}
+    max_workers = CompressionParameter.nb_workers.bounds()[1]
+    if max_workers > 0:
+        options[CompressionParameter.nb_workers] = min(_ZSTD_THREADS, max_workers)
+    return ZstdCompressor(options=options)
 
 
 class _MultiFrameZstdCompressObj:
     """A zstd compressobj that chunks its output into multiple frames.
 
-    Wraps a ``zstandard`` compressobj and flushes it (finalizing the current
-    frame) and replaces it (starting a new frame) every
-    ``_MAX_INPUT_PER_FRAME`` bytes of input. Multi-frame zstd streams are
-    valid per spec -- any compliant decoder reads them transparently.
+    Ends the current frame (``FLUSH_FRAME``) every ``_MAX_INPUT_PER_FRAME``
+    bytes of input; the compressor then starts a new frame on the next input.
+    Multi-frame zstd streams are valid per spec -- any compliant decoder reads
+    them transparently.
     """
 
-    def __init__(self, factory: Callable[[], zstandard.ZstdCompressionObj]) -> None:
-        self._factory = factory
-        self._obj = factory()
+    def __init__(self, compressor: ZstdCompressor) -> None:
+        self._compressor = compressor
         self._input_bytes = 0
 
     def compress(self, data: bytes) -> bytes:
@@ -94,74 +127,41 @@ class _MultiFrameZstdCompressObj:
         while offset < n:
             remaining_cap = _MAX_INPUT_PER_FRAME - self._input_bytes
             end = min(offset + remaining_cap, n)
-            chunk = view[offset:end]
-            pieces.append(self._obj.compress(chunk))
+            pieces.append(self._compressor.compress(view[offset:end]))
             self._input_bytes += end - offset
             offset = end
             if self._input_bytes >= _MAX_INPUT_PER_FRAME:
-                pieces.append(self._obj.flush())
-                self._obj = self._factory()
+                pieces.append(self._compressor.flush(ZstdCompressor.FLUSH_FRAME))
                 self._input_bytes = 0
         return b"".join(pieces)
 
     def flush(self) -> bytes:
         # If the last ``compress()`` call landed exactly on the frame boundary,
-        # ``self._obj`` was replaced with a fresh compressobj that has received
-        # no bytes. Flushing it would append an empty 9-byte trailing frame.
+        # the frame is already ended. Flushing again would append an empty
+        # trailing frame.
         if self._input_bytes == 0:
             return b""
-        return self._obj.flush()
+        self._input_bytes = 0
+        return self._compressor.flush(ZstdCompressor.FLUSH_FRAME)
 
 
-class _MultiFrameZstdDecompressObj:
-    """A zstd decompressobj that transparently spans multiple frames.
+class _MultiFrameZstdDecompressObj(ZstdMultiFrameDecompressor):
+    """A zstd decompressobj for ``zipfile`` that spans multiple frames.
 
-    ``zstandard.ZstdDecompressor().decompressobj()`` stops at the first frame
-    boundary and marks ``eof=True``.  When the compressor splits large entries
-    into multiple frames (see ``_MultiFrameZstdCompressObj``), the reader must
-    recognise the frame boundary, start a fresh inner decompressobj, and
-    continue until all compressed bytes have been consumed.
-
-    The stdlib ``zipfile._read1`` path for non-deflate compression does:
+    The compressor splits large entries into multiple frames (see
+    ``_MultiFrameZstdCompressObj``). The stdlib ``zipfile._read1`` path for
+    non-deflate compression does:
 
         data = self._decompressor.decompress(data)
         self._eof = self._decompressor.eof or self._compress_left <= 0
 
     We return ``eof=False`` always so that ``self._eof`` is driven purely by
-    ``self._compress_left <= 0`` (all compressed bytes fed).  Meanwhile,
-    ``decompress`` buffers leftover bytes from a completed frame and feeds them
-    into the next inner decompressobj.
+    ``self._compress_left <= 0`` (all compressed bytes fed).
 
     Since CPython gh-156002, ``_read1`` calls ``decompress(data, max_length)``
     and reads more compressed bytes only while ``needs_input`` is True (draining
-    with ``decompress(b"")`` otherwise); both are provided here.
+    with ``decompress(b"")`` otherwise); both are provided by the base class.
     """
-
-    def __init__(self) -> None:
-        import zstandard as zstd  # local import -- already a hard dep
-
-        self._dctx: zstandard.ZstdDecompressor = zstd.ZstdDecompressor()
-        self._obj: zstandard.ZstdDecompressionObj = self._dctx.decompressobj()
-        self._pending: bytes = b""
-
-    def decompress(self, data: bytes, max_length: int = -1) -> bytes:
-        # max_length is accepted but not enforced: the zstandard decompressobj has
-        # no output bound, so withholding bytes here would only copy an expansion
-        # that is already allocated. ZipExtFile buffers oversize returns anyway.
-        self._pending += data
-        out = b""
-        while self._pending:
-            result = self._obj.decompress(self._pending)
-            out += result
-            if self._obj.eof:
-                # Inner frame complete; unused_data holds the start of the next.
-                self._pending = self._obj.unused_data
-                self._obj = self._dctx.decompressobj()
-            else:
-                # All pending input consumed; wait for more.
-                self._pending = b""
-                break
-        return out
 
     def flush(self) -> bytes:
         return b""
@@ -171,18 +171,12 @@ class _MultiFrameZstdDecompressObj:
         # Always False: let compress_left drive the outer EOF check.
         return False
 
-    @property
-    def needs_input(self) -> bool:
-        # decompress() never leaves input or output pending; nothing to drain.
-        return True
-
 
 def _install_multiframe_patches() -> None:
     """Install multi-frame zstd compressor and decompressor patches.
 
-    Idempotent. Wraps whatever ``_get_compressor`` / ``_get_decompressor`` were
-    installed before us (stdlib on Py >= 3.14; ``zipfile_zstd``'s versions on
-    Py < 3.14), so compression level and thread count are preserved.
+    Idempotent. Wraps the stdlib ``_get_compressor`` / ``_get_decompressor``
+    and handles zstd itself on every Python version.
     """
     if getattr(zipfile, "_inspect_ai_multiframe_installed", False):
         return
@@ -192,18 +186,11 @@ def _install_multiframe_patches() -> None:
 
     def patched_compressor(compress_type: int, compresslevel: int | None = None) -> Any:
         if compress_type == _ZIP_ZSTANDARD:
-            # Share one ``ZstdCompressor`` across all frames of the entry.
-            # Delegating to ``original_compressor`` would instead create a
-            # fresh ``ZstdCompressor(threads=N)`` per frame, re-initialising
-            # its thread pool every 200 MiB.
-            import zstandard
-
             # Level and (implicit) window: stay under the viewer limits
             # documented at _MAX_INPUT_PER_FRAME above. The merge copies
             # these frames as-is, without recompressing them.
             level = 3 if compresslevel is None else compresslevel
-            compressor = zstandard.ZstdCompressor(level=level, threads=_ZSTD_THREADS)
-            return _MultiFrameZstdCompressObj(compressor.compressobj)
+            return _MultiFrameZstdCompressObj(_zstd_compressor(level))
         return original_compressor(compress_type, compresslevel)
 
     def patched_decompressor(compress_type: int) -> Any:

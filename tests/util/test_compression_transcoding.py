@@ -4,9 +4,8 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 
-import zstandard
-
 from inspect_ai._util.compression_transcoding import _ZstdDecompressIterator
+from inspect_ai._util.zstd import compress
 
 
 async def _aiter_chunks(data: bytes, chunk_size: int) -> AsyncIterator[bytes]:
@@ -17,8 +16,7 @@ async def _aiter_chunks(data: bytes, chunk_size: int) -> AsyncIterator[bytes]:
 
 def _multi_frame_zstd(parts: list[bytes]) -> bytes:
     """Compress each part as its own zstd frame; concatenate the frames."""
-    cctx = zstandard.ZstdCompressor()
-    return b"".join(cctx.compress(part) for part in parts)
+    return b"".join(compress(part) for part in parts)
 
 
 async def test_multi_frame_round_trip() -> None:
@@ -37,7 +35,7 @@ async def test_multi_frame_round_trip() -> None:
 async def test_single_frame_still_works() -> None:
     """Single-frame zstd input still decompresses correctly (no regression)."""
     payload = b"hello zstd " * 1024
-    compressed = zstandard.ZstdCompressor().compress(payload)
+    compressed = compress(payload)
 
     iterator = _ZstdDecompressIterator(_aiter_chunks(compressed, 16))
     chunks: list[bytes] = []

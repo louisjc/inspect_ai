@@ -76,9 +76,9 @@ from pathlib import Path
 from typing import Protocol
 
 import anyio
-import zstandard
 from typing_extensions import Buffer
 
+from inspect_ai._util.zstd import ZstdError, ZstdFile
 from inspect_ai.util._sandbox._privileged import privileged_shell
 from inspect_ai.util._sandbox.environment import SandboxEnvironment
 
@@ -487,11 +487,9 @@ def _check_archive(
     scan = TarHeaderScan(label=label)
     with open(path, "rb") as raw:
         hashed = io.BufferedReader(_TeeRaw(raw, digest.update))
-        decompressed: zstandard.ZstdDecompressionReader | gzip.GzipFile
+        decompressed: ZstdFile | gzip.GzipFile
         if path.name.endswith(".tar.zst"):
-            decompressed = zstandard.ZstdDecompressor().stream_reader(
-                hashed, read_across_frames=True
-            )
+            decompressed = ZstdFile(hashed, "rb")
         else:
             decompressed = gzip.GzipFile(fileobj=hashed, mode="rb")
         stream = io.BufferedReader(_TeeRaw(decompressed, scan.feed))
@@ -510,7 +508,7 @@ def _check_archive(
                         )
         except (
             tarfile.TarError,
-            zstandard.ZstdError,
+            ZstdError,
             gzip.BadGzipFile,
             EOFError,
             zlib.error,

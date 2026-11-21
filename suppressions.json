@@ -297,21 +297,9 @@
     }
   },
   "src/inspect_ai/_util/zipfile.py": {
-    "noqa:F401": {
-      "count": 1,
-      "undescribed": 1
-    },
     "type: ignore[attr-defined]": {
-      "count": 6,
-      "undescribed": 6
-    },
-    "type: ignore[import-not-found]": {
-      "count": 1,
-      "undescribed": 1
-    },
-    "type: ignore[import-untyped]": {
-      "count": 1,
-      "undescribed": 1
+      "count": 5,
+      "undescribed": 5
     }
   },
   "src/inspect_ai/_view/azure.py": {
@@ -1822,19 +1810,11 @@
     }
   },
   "tests/util/test_async_zip.py": {
-    "noqa:F401": {
-      "count": 1,
-      "undescribed": 1
-    },
     "type: ignore": {
       "count": 1,
       "undescribed": 1
     },
     "type: ignore[arg-type]": {
-      "count": 1,
-      "undescribed": 1
-    },
-    "type: ignore[import-untyped]": {
       "count": 1,
       "undescribed": 1
     }

@@ -34,13 +34,13 @@ from unittest.mock import patch
 
 import anyio
 import pytest
-import zstandard
 from test_helpers.local_shell_sandbox import (
     LocalShellSandbox,
     linux_like_path,
     sandbox_path,
 )
 
+from inspect_ai._util.zstd import compress as zstd_compress
 from inspect_ai.util._checkpoint._copy import copy_in, copy_out, copy_out_partial_path
 from inspect_ai.util._checkpoint._layout.schemas import Checkpoint, SnapshotDetails
 from inspect_ai.util._checkpoint._restore_scope import (
@@ -438,7 +438,7 @@ def _crafted_archive(
 def _compressed_archive(path: Path, raw_tar: bytes) -> str:
     """Compress ``raw_tar`` as ``path``'s extension says; return the file's sha256."""
     if path.name.endswith(".tar.zst"):
-        payload = zstandard.ZstdCompressor().compress(raw_tar)
+        payload = zstd_compress(raw_tar)
     else:
         payload = gzip.compress(raw_tar)
     path.write_bytes(payload)
@@ -1099,7 +1099,7 @@ def test_check_archive_hashes_bytes_past_the_tar_end_marker(
         {_rel(root / "a"): b"a"},
     )
     trailer = (
-        zstandard.ZstdCompressor().compress(b"\0" * 1024)
+        zstd_compress(b"\0" * 1024)
         if compression == "zst"
         else gzip.compress(b"\0" * 1024)
     )

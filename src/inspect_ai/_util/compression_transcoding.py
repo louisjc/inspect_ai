@@ -3,11 +3,11 @@ from contextlib import AbstractAsyncContextManager
 from types import TracebackType
 from typing import Literal
 
-import zstandard
 from anyio.abc import ByteReceiveStream
 
 from .compression import DeflateCompressor, DeflateDecompressor, ZstdDecompressor
 from .zip_common import ZipCompressionMethod
+from .zstd import ZstdMultiFrameDecompressor
 
 
 class CompressedToUncompressedStream(AsyncIterator[bytes]):
@@ -194,9 +194,7 @@ class _ZstdDecompressIterator(AsyncIterator[bytes]):
 
     def __init__(self, source: AsyncIterator[bytes]):
         self._source = source
-        self._dctx = zstandard.ZstdDecompressor()
-        self._obj: zstandard.ZstdDecompressionObj = self._dctx.decompressobj()
-        self._pending: bytes = b""
+        self._obj = ZstdMultiFrameDecompressor()
         self._exhausted = False
 
     def __aiter__(self) -> AsyncIterator[bytes]:
@@ -207,23 +205,11 @@ class _ZstdDecompressIterator(AsyncIterator[bytes]):
             raise StopAsyncIteration
 
         while True:
-            if self._pending:
-                data, self._pending = self._pending, b""
-            else:
-                try:
-                    data = await self._source.__anext__()
-                except StopAsyncIteration:
-                    try:
-                        final = self._obj.decompress(b"")
-                    except zstandard.ZstdError:
-                        final = b""
-                    self._exhausted = True
-                    if final:
-                        return final
-                    raise
+            try:
+                data = await self._source.__anext__()
+            except StopAsyncIteration:
+                self._exhausted = True
+                raise
             decompressed = self._obj.decompress(data)
-            if self._obj.eof:
-                self._pending = self._obj.unused_data
-                self._obj = self._dctx.decompressobj()
             if decompressed:
                 return decompressed

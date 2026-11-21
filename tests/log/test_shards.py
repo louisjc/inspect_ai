@@ -16,7 +16,6 @@ import anyio
 import boto3
 import click.testing
 import pytest
-import zstandard
 
 from inspect_ai import Epochs, Task, eval, eval_retry, task, task_with
 from inspect_ai._eval.task import run as run_module
@@ -25,6 +24,7 @@ from inspect_ai._util.asyncfiles import AsyncFilesystem, DirListing
 from inspect_ai._util.error import WriteConflictError
 from inspect_ai._util.file import FileInfo, local_path
 from inspect_ai._util.zipfile import RawMemberWriter, zipfile_compress_kwargs
+from inspect_ai._util.zstd import CompressionParameter, ZstdError, compress
 from inspect_ai.dataset import Sample
 from inspect_ai.log import (
     EvalLog,
@@ -5612,7 +5612,7 @@ def test_a_sample_member_with_an_incomplete_zstd_frame_fails_the_merge(
             + sample
         )
     else:
-        frame = zstandard.ZstdCompressor(write_checksum=True).compress(sample)[:-4]
+        frame = compress(sample, options={CompressionParameter.checksum_flag: 1})[:-4]
     with zipfile.ZipFile(path) as src:
         members = [(i.filename, src.read(i)) for i in src.infolist()]
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as dst:
@@ -5627,7 +5627,7 @@ def test_a_sample_member_with_an_incomplete_zstd_frame_fails_the_merge(
                 dst.writestr(member, data)
     with zipfile.ZipFile(path) as zf:
         assert zf.read(name) == sample
-    with pytest.raises(zstandard.ZstdError, match="incomplete or truncated"):
+    with pytest.raises(ZstdError, match="incomplete or truncated"):
         merge_eval_log_shards(merged, _task())
     assert not os.path.exists(merged)
 

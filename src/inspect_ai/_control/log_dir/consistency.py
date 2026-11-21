@@ -23,7 +23,6 @@ import zlib
 from collections.abc import Awaitable, Callable
 from typing import TypeVar
 
-import zstandard
 from pydantic import ValidationError
 
 from inspect_ai._util.async_zip import AsyncZipReader, CentralDirectory, ZipCrcError
@@ -33,6 +32,7 @@ from inspect_ai._util.asyncfiles import (
     is_s3_filename,
 )
 from inspect_ai._util.file import filesystem, local_path
+from inspect_ai._util.zstd import ZstdError
 
 from .walk import LogFile
 
@@ -49,7 +49,7 @@ _TORN_READ_ERRORS = (
     ZipCrcError,
     ObjectChangedError,
     zlib.error,
-    zstandard.ZstdError,
+    ZstdError,
     struct.error,
     EOFError,
     _IJSON_ERROR,

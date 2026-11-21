@@ -194,8 +194,9 @@ def _decodable_content_codings() -> frozenset[str]:
     httpx and httpx2 (used by the OpenAI and Anthropic SDKs) each skip a content
     coding they have no decoder for and pass the body on still encoded, so a
     client may only advertise codings both decode on this host. Both decode `br`
-    only with `brotli` installed, which Inspect does not require, and httpx2
-    decodes `zstd` only on Python 3.14+ or with `backports.zstd` installed. If
+    only with `brotli` installed, which Inspect does not require; httpx decodes
+    `zstd` only with `zstandard` installed, which Inspect does not require
+    either, and httpx2 only on Python 3.14+ or with `backports.zstd`. If
     httpx's private decoder table cannot be imported, no coding is treated as
     decodable and the client's `Accept-Encoding` is dropped.
     """

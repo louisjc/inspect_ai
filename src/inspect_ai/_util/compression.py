@@ -1,10 +1,9 @@
 import zlib
 from collections.abc import AsyncIterator, Callable, Generator
-from typing import IO, Protocol, cast
-
-import zstandard
+from typing import Protocol
 
 from .zip_common import ZipCompressionMethod
+from .zstd import ZstdError, ZstdMultiFrameDecompressor
 
 
 class Decompressor(Protocol):
@@ -33,9 +32,7 @@ class ZstdDecompressor(Decompressor):
     """Decompressor for zstd compressed data, supporting multi-frame streams."""
 
     def __init__(self) -> None:
-        self._dctx: zstandard.ZstdDecompressor | None = None
-        self._obj: zstandard.ZstdDecompressionObj | None = None
-        self._pending: bytes = b""
+        self._obj = ZstdMultiFrameDecompressor()
         self._exhausted = False
 
     @property
@@ -46,34 +43,15 @@ class ZstdDecompressor(Decompressor):
         """Read compressed chunks until decompressed output is available."""
         if self._exhausted:
             raise StopAsyncIteration
-        if self._dctx is None:
-            self._dctx = zstandard.ZstdDecompressor()
-            self._obj = self._dctx.decompressobj()
-        assert self._obj is not None and self._dctx is not None
         while True:
-            if self._pending:
-                data, self._pending = self._pending, b""
-            else:
-                try:
-                    data = await stream_iterator.__anext__()
-                except StopAsyncIteration:
-                    # Note: Unlike zlib, zstandard's decompressobj doesn't have
-                    # a flush() method. Passing empty bytes can trigger output
-                    # of any remaining buffered data in some edge cases.
-                    try:
-                        final = self._obj.decompress(b"")
-                    except zstandard.ZstdError:
-                        final = b""
-                    self._obj = None
-                    self._dctx = None
-                    self._exhausted = True
-                    if final:
-                        return final
-                    raise
+            try:
+                data = await stream_iterator.__anext__()
+            except StopAsyncIteration:
+                # decompress() returns all the output its input allows, so
+                # nothing is left to flush
+                self._exhausted = True
+                raise
             decompressed = self._obj.decompress(data)
-            if self._obj.eof:
-                self._pending = self._obj.unused_data
-                self._obj = self._dctx.decompressobj()
             if decompressed:
                 return decompressed
 
@@ -116,8 +94,7 @@ class PieceDecompressor:
     as it arrives holds only one at a time. Multi-frame zstd data is read
     across its frames. Bytes after the end of a deflate stream are refused
     (`zlib.error`). Blocking (CPU-bound): run it in a worker
-    thread from async code. `sink` must not refer back to the decompressor:
-    garbage collection cannot see into the native zstd writer.
+    thread from async code.
     """
 
     def __init__(
@@ -130,17 +107,13 @@ class PieceDecompressor:
         self._sink = sink
         self._piece_size = piece_size
         self._deflate: zlib._Decompress | None = None
-        self._zstd: zstandard.ZstdDecompressionWriter | None = None
+        self._zstd: ZstdMultiFrameDecompressor | None = None
         self._zstd_frames: _ZstdFrames | None = None
         if method == ZipCompressionMethod.DEFLATE:
             self._deflate = zlib.decompressobj(-15)  # Raw DEFLATE
         elif method == ZipCompressionMethod.ZSTD:
-            self._zstd = zstandard.ZstdDecompressor().stream_writer(
-                cast(IO[bytes], _SinkWriter(sink)),
-                write_size=piece_size,
-                closefd=False,
-            )
-            # the stream writer cannot tell whether the data ended mid-frame
+            self._zstd = ZstdMultiFrameDecompressor()
+            # the decompressor does not report data that ends mid-frame
             self._zstd_frames = _ZstdFrames()
         elif method != ZipCompressionMethod.STORED:
             raise NotImplementedError(f"Unsupported compression method: {method}")
@@ -152,7 +125,13 @@ class PieceDecompressor:
             zlib.error: Bytes follow the end of a deflate stream.
         """
         if self._zstd is not None:
-            self._zstd.write(data)
+            chunk = data
+            # a full piece may leave more output pending
+            while piece := self._zstd.decompress(chunk, self._piece_size):
+                self._sink(piece)
+                chunk = b""
+                if self._zstd.needs_input:
+                    break
             assert self._zstd_frames is not None
             self._zstd_frames.write(data)
         elif self._deflate is not None:
@@ -184,8 +163,9 @@ class PieceDecompressor:
         Raises:
             zlib.error: A deflate stream ended before its final block, as
                 `zlib.decompress` raises.
-            zstandard.ZstdError: A zstd frame ended before its last block or
-                its checksum.
+            ZstdError: A zstd frame ended before its last block or its
+                checksum (`compression.zstd.ZstdError`; `backports.zstd.ZstdError`
+                before Python 3.14).
         """
         if self._deflate is not None and not self._deflate.eof:
             raise zlib.error(
@@ -237,7 +217,7 @@ class _ZstdFrames:
 
     def finish(self) -> None:
         if not self._between_frames or self._field:
-            raise zstandard.ZstdError("incomplete or truncated zstd frame")
+            raise ZstdError("incomplete or truncated zstd frame")
 
     def _read_frames(self) -> Generator[int, bytes, None]:
         while True:
@@ -245,7 +225,7 @@ class _ZstdFrames:
             magic = yield 4
             self._between_frames = False
             if magic != _ZSTD_MAGIC:
-                raise zstandard.ZstdError("unsupported zstd frame")
+                raise ZstdError("unsupported zstd frame")
             descriptor = (yield 1)[0]
             single_segment = bool(descriptor & 0x20)
             content_size_flag = descriptor >> 6
@@ -263,23 +243,12 @@ class _ZstdFrames:
                 last = bool(block & 0x01)
                 block_type = (block >> 1) & 0x03
                 if block_type == _ZSTD_RESERVED_BLOCK:
-                    raise zstandard.ZstdError("reserved zstd block type")
+                    raise ZstdError("reserved zstd block type")
                 content = 1 if block_type == _ZSTD_RLE_BLOCK else block >> 3
                 if content:
                     yield -content
             if descriptor & 0x04:  # content checksum
                 yield -4
-
-
-class _SinkWriter:
-    """The file-like writer `zstandard`'s stream writer passes its output to."""
-
-    def __init__(self, sink: Callable[[bytes], None]) -> None:
-        self._sink = sink
-
-    def write(self, data: bytes) -> int:
-        self._sink(data)
-        return len(data)
 
 
 def decompress_bytes(data: bytes, method: ZipCompressionMethod) -> bytes:
@@ -289,7 +258,7 @@ def decompress_bytes(data: bytes, method: ZipCompressionMethod) -> bytes:
     elif method == ZipCompressionMethod.DEFLATE:
         return zlib.decompress(data, -15)
     elif method == ZipCompressionMethod.ZSTD:
-        return zstandard.ZstdDecompressor().stream_reader(data).read()
+        return ZstdMultiFrameDecompressor().decompress(data)
     else:
         raise NotImplementedError(f"Unsupported compression method: {method}")
 

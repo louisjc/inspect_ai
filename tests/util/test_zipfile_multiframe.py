@@ -13,22 +13,22 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-import zstandard
 from test_helpers.zstd import (
     ZSTD_MAGIC,
     moderately_compressible_payload,
     read_raw_compressed_entry,
 )
 
-# Importing this module installs the zstd compression patches (both the
-# zipfile_zstd delegation on Python < 3.14 and our multi-frame wrapper).
+# Importing this module installs the zstd compression patches (registering
+# ZIP_ZSTANDARD on Python < 3.14, and our multi-frame wrapper).
 import inspect_ai._util.zipfile
+from inspect_ai._util.zstd import ZstdDecompressor, compress
 
 MAX_INPUT_PER_FRAME = 200 * 1024 * 1024  # must match the value in _util/zipfile.py
 
-# zipfile_zstd adds ZIP_ZSTANDARD (93) to zipfile at import time; use getattr
-# so type checkers on Python < 3.14 (where stdlib zipfile doesn't declare it)
-# stay happy.
+# On Python < 3.14 ZIP_ZSTANDARD (93) is added to zipfile at import time; use
+# getattr so type checkers on Python < 3.14 (where stdlib zipfile doesn't
+# declare it) stay happy.
 ZIP_ZSTANDARD: int = getattr(zipfile, "ZIP_ZSTANDARD", 93)
 
 
@@ -40,13 +40,12 @@ def large_payload() -> bytes:
 
 def _iter_frames(compressed: bytes):
     """Yield (frame_index, decompressed_bytes) for each frame in a zstd stream."""
-    dctx = zstandard.ZstdDecompressor()
     idx = 0
     remaining = compressed
     while remaining:
-        obj = dctx.decompressobj()
+        obj = ZstdDecompressor()
         out = obj.decompress(remaining)
-        # decompressobj consumes one frame; remaining bytes are in unused_data
+        # the decompressor consumes one frame; remaining bytes are in unused_data
         yield idx, out
         idx += 1
         remaining = obj.unused_data
@@ -122,7 +121,8 @@ def _read_like_post_gh156002(decomp: Any, compressed: bytes, n: int) -> bytes:
     out, pos, eof, calls = bytearray(), 0, False, 0
     while not eof:
         calls += 1
-        assert calls <= len(compressed) // MIN_READ_SIZE + 4, (
+        # each call reads a slice of input or returns a bounded piece of output
+        assert calls <= (len(compressed) + len(out)) // MIN_READ_SIZE + 4, (
             "drain loop never terminates"
         )
         if needs_input(decomp):
@@ -140,13 +140,37 @@ def _read_like_post_gh156002(decomp: Any, compressed: bytes, n: int) -> bytes:
 @pytest.mark.parametrize("n", [4096, 65_536])
 def test_post_gh156002_read1_loop_reassembles_multi_frame_entry(n: int) -> None:
     payload = random.Random(0).randbytes(50_000)  # incompressible: ~1:1
-    cctx = zstandard.ZstdCompressor(level=3)
-    stream = cctx.compress(payload[:17_000]) + cctx.compress(payload[17_000:])
+    stream = compress(payload[:17_000], level=3) + compress(payload[17_000:], level=3)
     get_decompressor = getattr(zipfile, "_get_decompressor", None)
     assert get_decompressor is not None
     assert (
         _read_like_post_gh156002(get_decompressor(ZIP_ZSTANDARD), stream, n) == payload
     )
+
+
+def test_zip_decompressor_bounds_each_output_to_max_length() -> None:
+    """``decompress(data, max_length)`` holds back output past ``max_length``."""
+    payload = moderately_compressible_payload(1024 * 1024)
+    stream = compress(payload[:300_000]) + compress(payload[300_000:])
+    get_decompressor = getattr(zipfile, "_get_decompressor", None)
+    assert get_decompressor is not None
+    decomp = get_decompressor(ZIP_ZSTANDARD)
+    pieces = [decomp.decompress(stream, MIN_READ_SIZE)]
+    while not decomp.needs_input:
+        pieces.append(decomp.decompress(b"", MIN_READ_SIZE))
+    assert b"".join(pieces) == payload
+    assert max(len(piece) for piece in pieces) <= MIN_READ_SIZE
+
+
+def test_empty_entry_round_trip(tmp_path: Path) -> None:
+    """An empty entry is stored with no zstd frame and reads back empty."""
+    zip_path = tmp_path / "empty.zip"
+    with zipfile.ZipFile(zip_path, "w", compression=ZIP_ZSTANDARD) as zf:
+        zf.writestr("empty.json", b"")
+    assert read_raw_compressed_entry(zip_path, "empty.json") == b""
+    with zipfile.ZipFile(zip_path) as zf:
+        assert zf.getinfo("empty.json").compress_type == ZIP_ZSTANDARD
+        assert zf.read("empty.json") == b""
 
 
 def test_zip_member_read_paths_round_trip(

@@ -112,7 +112,8 @@ def merge_eval_log_shards(
     each frame at 200 MiB of uncompressed input — is copied as-is and can
     produce a merged sample the viewer cannot open. Inspect's own writer
     stays under those limits. An incomplete or skippable zstd frame fails
-    the merge with `zstandard.ZstdError`.
+    the merge with `compression.zstd.ZstdError` (`backports.zstd.ZstdError`
+    before Python 3.14).
 
     See [Sharding](https://inspect.aisi.org.uk/sharding.html) for the shard
     layout, when a set is complete, selections, scoring, merging shards run
@@ -146,8 +147,9 @@ def merge_eval_log_shards(
         WriteConflictError: Another merge holds the lock or published first.
             Run the merge again once it has finished. A lock file left by
             a merge that crashed stays until you delete it.
-        zstandard.ZstdError: A sample member's zstd frame is incomplete
-            or skippable.
+        compression.zstd.ZstdError: A sample member's zstd frame is
+            incomplete or skippable (`backports.zstd.ZstdError` before
+            Python 3.14).
         zlib.error: A sample member's deflate stream is incomplete, or
             bytes follow the end of the stream.
         FileNotFoundError: Neither the merged log nor any shard exists.

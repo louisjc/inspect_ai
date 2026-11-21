@@ -24,11 +24,11 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import anyio
-import zstandard
 from pydantic import ValidationError
 
 from inspect_ai._util._async import tg_collect
 from inspect_ai._util.asyncfiles import AsyncFilesystem
+from inspect_ai._util.zstd import ZstdError
 from inspect_ai.log._recorders.buffer.filestore import (
     MANIFEST,
     Manifest,
@@ -57,7 +57,7 @@ _SEGMENT_READ_ERRORS = (
     KeyError,
     ValidationError,
     zlib.error,
-    zstandard.ZstdError,
+    ZstdError,
     struct.error,
     EOFError,
 )

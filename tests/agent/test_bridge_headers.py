@@ -16,6 +16,7 @@ from httpx2._decoders import SUPPORTED_DECODERS as HTTPX2_DECODERS
 from packaging.requirements import Requirement
 
 from inspect_ai._util import logger as inspect_logger
+from inspect_ai._util.zstd import compress as zstd_compress
 from inspect_ai.agent._agent import AgentState
 from inspect_ai.agent._bridge import bridge as bridge_module
 from inspect_ai.agent._bridge.bridge import (
@@ -43,7 +44,6 @@ try:
     brotli = importlib.import_module("brotli")
 except ImportError:
     brotli = importlib.import_module("brotlicffi")
-zstandard = importlib.import_module("zstandard")
 
 
 class TestFilterBridgeHeaders:
@@ -509,11 +509,13 @@ class TestForwardClientHeaders:
 
 
 def _zstd_decodable() -> bool:
-    """Whether httpx2 (the OpenAI and Anthropic SDKs' client) can decode zstd."""
-    return sys.version_info >= (3, 14) or (
+    """Whether httpx and httpx2 (the OpenAI and Anthropic SDKs' client) can decode zstd."""
+    httpx_decodes = importlib.util.find_spec("zstandard") is not None
+    httpx2_decodes = sys.version_info >= (3, 14) or (
         importlib.util.find_spec("backports") is not None
         and importlib.util.find_spec("backports.zstd") is not None
     )
+    return httpx_decodes and httpx2_decodes
 
 
 class TestDecodableAcceptEncoding:
@@ -601,7 +603,7 @@ class TestDecodableAcceptEncoding:
             body = json.dumps(message).encode()
             # a provider prefers zstd when the client offers it
             if "zstd" in request.headers["accept-encoding"]:
-                content, encoding = zstandard.ZstdCompressor().compress(body), "zstd"
+                content, encoding = zstd_compress(body), "zstd"
             else:
                 content, encoding = brotli.compress(body), "br"
             return httpx2.Response(

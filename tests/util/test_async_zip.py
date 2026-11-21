@@ -1,7 +1,6 @@
 import json
 import os
 import struct
-import sys
 import zipfile
 import zlib
 from collections.abc import AsyncIterator
@@ -16,10 +15,10 @@ from inspect_ai._util.async_zip import AsyncZipReader, CentralDirectory, ZipCrcE
 from inspect_ai._util.asyncfiles import AsyncFilesystem
 from inspect_ai._util.compression_transcoding import _DeflateCompressStream
 from inspect_ai._util.zip_common import ZipCompressionMethod, ZipEntry
+from inspect_ai._util.zipfile import zipfile_compress_kwargs
 
-# Import zipfile-zstd for Python < 3.14 (monkey-patches zipfile to support zstd)
-if sys.version_info < (3, 14):
-    import zipfile_zstd  # type: ignore[import-untyped]  # noqa: F401
+# zstd (method 93); importing inspect_ai._util.zipfile registers it on Python < 3.14
+ZIP_ZSTANDARD: int = zipfile_compress_kwargs["compression"]
 
 
 @pytest.fixture
@@ -187,10 +186,7 @@ def zstd_zip_file(tmp_path: Path) -> Path:
     """Create a test ZIP file compressed with zstd (method 93)."""
     zip_path = tmp_path / "zstd_test.zip"
 
-    # zipfile-zstd adds ZIP_ZSTANDARD (93) to zipfile
-    # Use getattr to satisfy both mypy and runtime
-    zstd_compression: int = getattr(zipfile, "ZIP_ZSTANDARD", 93)
-    with zipfile.ZipFile(zip_path, "w", compression=zstd_compression) as zf:
+    with zipfile.ZipFile(zip_path, "w", compression=ZIP_ZSTANDARD) as zf:
         zf.writestr("test.json", json.dumps({"message": "hello zstd"}))
 
     return zip_path
@@ -738,8 +734,7 @@ async def test_read_multi_frame_zstd_member(
 
     payload = moderately_compressible_payload(256 * 1024)
     zip_path = tmp_path / "multi_frame_zstd.zip"
-    zip_zstandard: int = getattr(zipfile, "ZIP_ZSTANDARD", 93)
-    with zipfile.ZipFile(zip_path, "w", compression=zip_zstandard) as zf:
+    with zipfile.ZipFile(zip_path, "w", compression=ZIP_ZSTANDARD) as zf:
         zf.writestr("big.json", payload)
 
     raw = read_raw_compressed_entry(zip_path, "big.json")

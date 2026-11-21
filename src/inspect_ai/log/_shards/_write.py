@@ -171,8 +171,9 @@ async def write_merged_zip(
         ZipCrcError: A sample member's bytes do not match its CRC-32.
         zlib.error: A sample member's deflate stream is incomplete, or
             bytes follow the end of the stream.
-        zstandard.ZstdError: A sample member's zstd frame is incomplete
-            or skippable.
+        compression.zstd.ZstdError: A sample member's zstd frame is
+            incomplete or skippable (`backports.zstd.ZstdError` before
+            Python 3.14).
     """
     with zipfile.ZipFile(out, "w", **zipfile_compress_kwargs) as zf:
         inputs: list[_SampleInputs] = []

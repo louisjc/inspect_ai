@@ -2,10 +2,10 @@ import os
 import zlib
 
 import pytest
-import zstandard
 
 from inspect_ai._util.compression import PieceDecompressor
 from inspect_ai._util.zip_common import ZipCompressionMethod
+from inspect_ai._util.zstd import CompressionParameter, ZstdError, compress
 
 
 def _compress(data: bytes, method: ZipCompressionMethod) -> bytes:
@@ -15,8 +15,7 @@ def _compress(data: bytes, method: ZipCompressionMethod) -> bytes:
     if method == ZipCompressionMethod.ZSTD:
         # two frames, as the zip writer splits large members
         half = len(data) // 2
-        zstd = zstandard.ZstdCompressor()
-        return zstd.compress(data[:half]) + zstd.compress(data[half:])
+        return compress(data[:half]) + compress(data[half:])
     return data
 
 
@@ -103,16 +102,19 @@ def test_piece_decompressor_refuses_an_incomplete_zstd_frame(
     frame: str, complete: bool
 ) -> None:
     data = os.urandom(100 * 1024).hex().encode()
-    zstd = zstandard.ZstdCompressor(write_checksum=True)
+
+    def zstd_compress(data: bytes) -> bytes:
+        return compress(data, options={CompressionParameter.checksum_flag: 1})
+
     compressed = {
         "raw blocks": _zstd_frame_of_raw_blocks(data, last_block=True),
         "raw blocks without the last-block flag": _zstd_frame_of_raw_blocks(
             data, last_block=False
         ),
-        "compressed with a checksum": zstd.compress(data),
-        "compressed without its checksum": zstd.compress(data)[:-4],
-        "two frames, the second truncated": zstd.compress(data[:1000])
-        + zstd.compress(data[1000:])[:-100],
+        "compressed with a checksum": zstd_compress(data),
+        "compressed without its checksum": zstd_compress(data)[:-4],
+        "two frames, the second truncated": zstd_compress(data[:1000])
+        + zstd_compress(data[1000:])[:-100],
     }[frame]
     pieces: list[bytes] = []
     decompressor = PieceDecompressor(ZipCompressionMethod.ZSTD, pieces.append)
@@ -123,5 +125,5 @@ def test_piece_decompressor_refuses_an_incomplete_zstd_frame(
         decompressor.finish()
         assert b"".join(pieces) == data
     else:
-        with pytest.raises(zstandard.ZstdError, match="incomplete or truncated"):
+        with pytest.raises(ZstdError, match="incomplete or truncated"):
             decompressor.finish()
